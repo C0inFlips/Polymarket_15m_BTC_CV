@@ -1,0 +1,3 @@
+httpx>=0.27
+# Polymarket execution layer (CLOB V2 — V1 was retired 2026-04-28)
+py-clob-client-v2
