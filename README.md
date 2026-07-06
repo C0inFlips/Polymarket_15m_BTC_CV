@@ -1,4 +1,4 @@
-﻿# Polymarket BTC 15m Scalper — ChainVector Edition
+﻿# Polymarket BTC 15m bot — ChainVector Edition
 
 Autonomous trading daemon for Polymarket's 15-minute "Bitcoin Up or Down"
 binary markets (`btc-updown-15m-{unix_window_start}`). It wakes for each
