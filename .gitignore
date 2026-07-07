@@ -11,6 +11,7 @@ logs/
 *.jsonl
 _backtest_cache_*.json
 cv_prob_snapshots/
+cv_state/
 
 # Python
 __pycache__/
@@ -24,3 +25,4 @@ venv/
 Thumbs.db
 .idea/
 .vscode/
+_smoke_*

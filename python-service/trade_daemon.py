@@ -16,6 +16,10 @@ Signals architecture:
     (lead-lag feed + EV weight + veto), prediction-market quote stability &
     model edge, liquidation cascade risk & heatmap, order flow, whale
     pressure, funding, volatility/regime context (recorded).
+  â€¢ cv_collector.py â€” optional ~5s ChainVector state writer
+    (cv_state/latest_{asset}.json) backing the CV-FLOW / CV-EV / CV-REV
+    entry vetoes, the CV-REV in-trade exit, the CV-confirmed SL deferral
+    and the --cv-shadow-enabled audit stamp (all fail-open when stale).
 
 Strategy templates (--strategy): baseline | conservative | momentum |
 regime | edge â€” presets over the gate stack; every knob remains
@@ -209,6 +213,14 @@ def _bidstab_check(window_id, side, lookback_s, max_fade_c, min_samples):
     if net < -2:
         return (f"bid FALLING: {side} bid {first}c -> {last}c "
                 f"({net:+d}c over {now - path[0][0]:.0f}s)")
+        # 2026-07-03: SPIKE veto (fleet-wide). A bid that rose >15c inside the
+        # lookback is the market DISCOVERING the move, not one that has priced
+        # it in. XRP (-$85, -$135) and SOL (-$84) all bought unconfirmed spikes
+        # that reversed and stop-lossed; SOL's market even settled in our favor
+        # after shaking us out. Transient: re-poll enters once the level holds.
+        if net > 15:
+            return (f"bid SPIKE: {side} bid {first}c -> {last}c "
+                    f"(+{net}c over {now - path[0][0]:.0f}s; unconfirmed repricing)")
     if peak - last > max_fade_c:
         return (f"bid OFF PEAK: {side} bid {peak}c peak -> {last}c now "
                 f"(fade {peak - last}c > {max_fade_c}c)")
@@ -2670,6 +2682,51 @@ async def main_loop(dry_run: bool, bankroll: float,
                      bid_stab_min_samples:     int   = 3,
                      bid_stab_burst_samples:   int   = 3,
                      bid_stab_burst_interval_s: float = 2.0,
+                     # 2026-07-05: HURST-CUSHION ENTRY VETO (near-strike
+                     # mean-reversion trap)
+                     hurst_cushion_veto_enabled: bool = False,
+                     hurst_cushion_hurst_max:  float = 0.40,
+                     hurst_cushion_dist_min:   float = 0.20,
+                     # 2026-07-05: CHAINVECTOR ADVERSE-FLOW ENTRY VETO
+                     cv_flow_veto_enabled: bool = False,
+                     cv_flow_breadth_min:  float = 0.25,
+                     cv_flow_mom_min:      float = -25.0,
+                     cv_flow_cascade_min:  float = 60.0,
+                     cv_flow_dist_max:     float = 0.10,
+                     cv_flow_max_age_s:    float = 20.0,
+                     cv_state_path:        str = "",
+                     # 2026-07-05: CV-EV ENTRY VETO (ensemble prob + sigma cushion)
+                     cv_ev_veto_enabled:   bool = False,
+                     cv_ev_prob_min:       float = 0.75,
+                     cv_ev_cushion_sigma_min: float = 0.50,
+                     cv_ev_max_age_s:      float = 30.0,
+                     # 2026-07-05: CV-REV ENTRY VETO (flip-market detector)
+                     cv_rev_veto_enabled:  bool = False,
+                     cv_rev_drop_min:      float = 0.12,
+                     cv_rev_p_max:         float = 0.90,
+                     cv_edge_veto_shadow: bool  = False,
+                     cv_edge_veto_max:    float = -0.05,
+                     cv_sl_defer_enabled: bool  = False,
+                     cv_sl_defer_p_min:   float = 0.75,
+                     cv_rev_cross_min:    int   = 0,
+                     cv_rev_spike_min:    float = 0.0,
+                     cv_rev_whale_max:     float = -60.0,
+                     cv_rev_breadth_max:   float = 0.25,
+                     cv_rev_mom_max:       float = 0.0,
+                     cv_rev_max_age_s:     float = 30.0,
+                     # 2026-07-05: CV-REV IN-TRADE EXIT (ensemble prob-drop)
+                     cv_rev_exit_enabled:  bool = False,
+                     cv_rev_exit_drop_min: float = 0.20,
+                     cv_rev_exit_p_max:    float = 0.80,
+                     cv_rev_exit_lm_gate: bool  = False,
+                     cv_rev_exit_lm_floor: float = 0.45,
+                     cv_rev_exit_streak:  int   = 2,
+                     cv_rev_exit_min_bid:  int   = 40,
+                     # 2026-07-05: CHASE ENTRY VETO (ask walk-up, native)
+                     chase_veto_enabled:   bool  = False,
+                     chase_veto_walkup_cents: int = 22,
+                     chase_veto_hurst_max: float = 0.45,
+                     chase_veto_lookback_mins: float = 4.0,
                      # 2026-06-29: TAKER-FLOW ENTRY VETO (near-strike trap)
                      taker_flow_veto_enabled:    bool  = False,
                      taker_flow_veto_agg_min:    float = 0.90,
@@ -5657,6 +5714,58 @@ async def main_loop(dry_run: bool, bankroll: float,
         # saved $3,626 in losses vs $2,493 winners clipped (+$1,133 net,
         # positive in BOTH halves). Fail-open below min samples. Transient:
         # re-polls while time remains, so a dip that recovers can re-enter.
+        # ── 2026-07-05: CHASE ENTRY VETO (ask walk-up + mean-reverting) ─────
+        # Fleet backtest (3 weeks, 1,043 settled trades): entries whose ask
+        # ran >= 22c above its 4-min low are the only net-negative walk-up
+        # bucket (-$1,932 / 550 trades); with hurst < 0.45 the veto blocks
+        # 245 (23L/222W, saves ~$1,333) and catches BNB 202607051745 (ask
+        # 57c->87c chase into the re-test top, hurst 0.449, lost -$43.65).
+        # Enabled per-asset where blocked-net is negative (BTC/XRP/DOGE/BNB);
+        # SOL/ETH chases historically win, left off there. Transient
+        # re-poll: a pullback toward the low re-opens the window.
+        if chase_veto_enabled:
+            _chv_reason = None
+            try:
+                _chv_rows = (globals().get("_chase_hist", {})
+                             .get((window_id, rec)) or [])
+                _chv_cut = time.time() - chase_veto_lookback_mins * 60.0
+                _chv_asks = [a for t0, a in _chv_rows if t0 >= _chv_cut and a]
+                _chv_cur = (mkt.get("yes_ask") if rec == "YES"
+                            else mkt.get("no_ask")) or limit_price
+                _chv_h = sig.get("hurst")
+                if (len(_chv_asks) >= 3 and _chv_cur
+                        and (_chv_h is None or _chv_h < chase_veto_hurst_max)):
+                    _chv_lo = min(_chv_asks)
+                    if _chv_cur - _chv_lo >= chase_veto_walkup_cents:
+                        _chv_reason = (
+                            f"ask walked {_chv_cur - _chv_lo}c off its "
+                            f"{chase_veto_lookback_mins:.0f}m low ({_chv_lo}c"
+                            f" -> {_chv_cur}c) with hurst "
+                            f"{_chv_h if _chv_h is not None else 'n/a'} < "
+                            f"{chase_veto_hurst_max:.2f} (mean-reverting): "
+                            f"chasing the re-test top")
+            except Exception:
+                _chv_reason = None
+            if _chv_reason:
+                log.warning(f"CHASE VETO — {rec} @ {limit_price}c: "
+                            f"{_chv_reason}; skipping entry. Re-polling "
+                            f"while time remains.")
+                audit.write(build_poll_record(
+                    window_id=window_id, ticker=ticker, close_dt=close_dt,
+                    decision="NO_TRADE", rec=rec,
+                    reasons=[f"chase_veto: {_chv_reason}"],
+                    signal=sig, market=mkt, recent_5m_pct=recent_5m,
+                    tp_cached=window_tp_cache.get(window_id),
+                    db_check=None, ev_calc=None, params=audit_params,
+                    orderbook=ob_snap, trade_flow=tr_snap,
+                ))
+                if mins_left > 3.5:
+                    await asyncio.sleep(10)
+                else:
+                    session.traded.add(window_id)
+                    await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+                continue
+
         if bid_stab_veto_enabled:
             _bsv = _bidstab_check(window_id, rec, bid_stab_lookback_s,
                                   bid_stab_max_fade_cents, bid_stab_min_samples)
@@ -5690,8 +5799,418 @@ async def main_loop(dry_run: bool, bankroll: float,
                     session.traded.add(window_id)
                     await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
                 continue
+        # ── 2026-07-04: ADVERSE-M60S HIGH-PRICE ENTRY VETO ──────────────────
+        # perp_m60s is signed toward the trade (positive = favorable). Paying
+        # >= 90c while the 60s perp tape runs >= 10bp AGAINST the position is
+        # paying near-max price to fight an in-progress move: upside is a few
+        # cents, downside is the ticket. Fleet backtest (2,538 trades):
+        # blocked 25, saved $721 vs $61 clipped, NET +$660, stable at 8-12bp.
+        # Fail-open if the perp feed is down. Transient re-poll (10s) like
+        # the perp veto — a 60s swing can pass within the window.
+        _ADV_M60S_PRICE_MIN = 90   # cents
+        _ADV_M60S_BP = -10.0       # signed-toward-trade threshold
+        if (limit_price >= _ADV_M60S_PRICE_MIN and _ns is not None
+                and _ns.get("perp_m60s") is not None
+                and _ns["perp_m60s"] <= _ADV_M60S_BP):
+            log.warning(
+                f"ADVERSE-M60S VETO — {rec} @ {limit_price}c: perp 60s momentum "
+                f"{_ns['perp_m60s']:+.2f}bp (signed toward {rec}) <= "
+                f"{_ADV_M60S_BP:+.1f}bp with price >= {_ADV_M60S_PRICE_MIN}c; "
+                f"skipping entry. Re-polling while time remains."
+            )
+            audit.write(build_poll_record(
+                window_id=window_id, ticker=ticker, close_dt=close_dt,
+                decision="NO_TRADE", rec=rec,
+                reasons=[f"adv_m60s_veto: m60s={_ns['perp_m60s']:+.2f}bp <= "
+                         f"{_ADV_M60S_BP:+.1f}bp @ {limit_price}c"],
+                signal=sig, market=mkt, recent_5m_pct=recent_5m,
+                tp_cached=window_tp_cache.get(window_id),
+                db_check=None, ev_calc=None, params=audit_params,
+                orderbook=ob_snap, trade_flow=tr_snap,
+            ))
+            if mins_left > 3.5:
+                await asyncio.sleep(10)
+            else:
+                session.traded.add(window_id)
+                await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+            continue
 
-        # â”€â”€ ChainVector PREDICTION QUOTE-STABILITY VETO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        # ── 2026-07-05: CV-EV ENTRY VETO (ensemble prob + sigma cushion) ────
+        # 9.5h of our own 5s CV tape vs settlements (348 leaning-side samples,
+        # 5 assets): ensemble p-for-side is sharply calibrated (Brier 0.06-0.10
+        # vs 0.19 for the venue mid) — leans with p_for<0.75 hold only 44-69%
+        # (coin flip) vs 97-100% above 0.85; and leans with |dist| < 0.5 x the
+        # CV expected-move sigma at exact TTE hold 55-64% vs ~100% beyond.
+        # Either condition makes a 95c entry EV-negative. Fail-open on stale/
+        # missing CV state; probability only applies when CV priced OUR ticker.
+        # ── 2026-07-05: CV-REV ENTRY VETO (flip-market detector) ────────────
+        # Fleet entry-time replay (536 decision points, 57 reversal windows,
+        # 5 assets): (A) once the CV ensemble p-for-side has FALLEN >=0.12
+        # from its running window peak and sits <0.90, the lean is a flip
+        # candidate — blocked 21R vs 27W (net95 +18.6). (B) "lone pump":
+        # whale flow <=-60 against the side with cross-venue breadth <=0.25
+        # and momentum <=0 — 9R vs 17W (net95 +7.7); this exact pattern was
+        # live at entry on the DOGE 202607051515 -$89 pump-and-fade loss
+        # (whale -91, breadth 0.15). Fail-open; transient re-poll.
+        if cv_rev_veto_enabled and cv_state_path:
+            _cvrev_reason = None
+            try:
+                with open(cv_state_path, encoding="utf-8") as _cvrf:
+                    _cvrev_d = json.load(_cvrf)
+                _cvrev_age = time.time() * 1000.0 - float(
+                    _cvrev_d.get("ts_ms") or 0)
+                if _cvrev_age <= cv_rev_max_age_s * 1000.0:
+                    _cvrev_p = _cvrev_d.get("probability") or {}
+                    _cvrev_pa = _cvrev_age + float(
+                        _cvrev_d.get("probability_age_ms") or 9e9)
+                    if (_cvrev_p.get("ensemble") is not None
+                            and _cvrev_p.get("market_id") == ticker
+                            and _cvrev_pa <= 45_000):
+                        _cvrev_raw = float(_cvrev_p["ensemble"])
+                        _cvrev_hist = globals().setdefault("_cvrev_hist", {})
+                        _cvrev_mm = _cvrev_hist.setdefault(
+                            window_id, [_cvrev_raw, _cvrev_raw])
+                        _cvrev_mm[0] = max(_cvrev_mm[0], _cvrev_raw)
+                        _cvrev_mm[1] = min(_cvrev_mm[1], _cvrev_raw)
+                        if len(_cvrev_hist) > 40:
+                            for _cvrev_k in sorted(_cvrev_hist)[:-20]:
+                                _cvrev_hist.pop(_cvrev_k, None)
+                        _cvrev_pfor = (_cvrev_raw if rec == "YES"
+                                       else 1.0 - _cvrev_raw)
+                        _cvrev_peak = (_cvrev_mm[0] if rec == "YES"
+                                       else 1.0 - _cvrev_mm[1])
+                        if (_cvrev_peak - _cvrev_pfor >= cv_rev_drop_min
+                                and _cvrev_pfor < cv_rev_p_max):
+                            _cvrev_reason = (
+                                f"ensemble p_for fell "
+                                f"{_cvrev_peak - _cvrev_pfor:.3f} from window "
+                                f"peak {_cvrev_peak:.3f} to {_cvrev_pfor:.3f} "
+                                f"< {cv_rev_p_max:.2f} (flip risk)")
+                        # 2026-07-06: whipsaw + fresh-spike arms. Backtested
+                        # on 669 settled tape windows (5 assets): veto when
+                        # spot crossed the strike >= cross_min times in 4m,
+                        # OR p_for rose >= spike_min within 3m (buying an
+                        # unconsolidated dislocation — the BTC 202607061445
+                        # -$157 entry had rise 0.76). Off unless the
+                        # --cv-rev-cross-min / --cv-rev-spike-min flags set
+                        # them > 0 (ETH excluded: backtest -2.6/c).
+                        _cvrev_pr = _cvrev_d.get("prob_roll") or {}
+                        _cvrev_pra = _cvrev_age + float(
+                            _cvrev_d.get("prob_roll_age_ms") or 9e9)
+                        if (_cvrev_reason is None
+                                and _cvrev_pra <= 45_000.0
+                                and _cvrev_pr.get("market_id") == ticker
+                                and int(_cvrev_pr.get("n_3m") or 0) >= 12):
+                            _cvrev_x = int(_cvrev_pr.get("lm_cross_4m") or 0)
+                            if (cv_rev_cross_min > 0
+                                    and _cvrev_x >= cv_rev_cross_min):
+                                _cvrev_reason = (
+                                    f"whipsaw: spot crossed strike "
+                                    f"{_cvrev_x}x in 4m "
+                                    f"(>= {cv_rev_cross_min})")
+                            elif cv_rev_spike_min > 0:
+                                _cvrev_rise = (
+                                    _cvrev_raw - float(
+                                        _cvrev_pr.get("ens_min_3m")
+                                        or _cvrev_raw)
+                                    if rec == "YES" else
+                                    float(_cvrev_pr.get("ens_max_3m")
+                                          or _cvrev_raw) - _cvrev_raw)
+                                if _cvrev_rise >= cv_rev_spike_min:
+                                    _cvrev_reason = (
+                                        f"fresh spike: p_for rose "
+                                        f"{_cvrev_rise:.3f} in 3m (>= "
+                                        f"{cv_rev_spike_min:.2f}) — "
+                                        f"unconsolidated move")
+                    # 2026-07-06: block-age guard — whale/breadth/mom
+                    # come from the WS feed and can be hours older than the
+                    # top-level ts_ms (collector WS died 07-05). Fail-open.
+                    _cvrev_ma = _cvrev_age + float(
+                        _cvrev_d.get("momentum_age_ms") or 9e9)
+                    _cvrev_sa = _cvrev_age + float(
+                        _cvrev_d.get("snapshot_age_ms") or 9e9)
+                    if (_cvrev_reason is None and _cvrev_ma <= 60_000.0
+                            and _cvrev_sa <= 60_000.0):
+                        _cvrev_mom = _cvrev_d.get("momentum") or {}
+                        _cvrev_wp = ((_cvrev_d.get("snapshot") or {})
+                                     .get("whale_pressure") or {})
+                        _cvrev_sgn = 1.0 if rec == "YES" else -1.0
+                        _cvrev_wdir = {"buying": 1.0, "selling": -1.0}.get(
+                            _cvrev_wp.get("direction"), 0.0)
+                        _cvrev_wfor = (_cvrev_sgn * _cvrev_wdir * abs(float(
+                            _cvrev_wp.get("pressure_score") or 0.0)))
+                        _cvrev_b = _cvrev_mom.get("breadth_up")
+                        _cvrev_bfor = ((float(_cvrev_b) if rec == "YES"
+                                        else 1.0 - float(_cvrev_b))
+                                       if _cvrev_b is not None else None)
+                        _cvrev_mfor = (_cvrev_sgn *
+                                       float(_cvrev_mom["aggregate_score"])
+                                       if _cvrev_mom.get("aggregate_score")
+                                       is not None else None)
+                        if (_cvrev_wfor <= cv_rev_whale_max
+                                and _cvrev_bfor is not None
+                                and _cvrev_bfor <= cv_rev_breadth_max
+                                and _cvrev_mfor is not None
+                                and _cvrev_mfor <= cv_rev_mom_max):
+                            _cvrev_reason = (
+                                f"lone pump: whale_for {_cvrev_wfor:.0f} <= "
+                                f"{cv_rev_whale_max:.0f} & breadth_for "
+                                f"{_cvrev_bfor:.2f} <= "
+                                f"{cv_rev_breadth_max:.2f} & mom_for "
+                                f"{_cvrev_mfor:.0f} <= {cv_rev_mom_max:.0f}")
+            except Exception:
+                _cvrev_reason = None
+            if _cvrev_reason:
+                log.warning(
+                    f"CV-REV VETO — {rec} @ {limit_price}c: {_cvrev_reason}; "
+                    f"possible reversal, skipping entry. Re-polling while "
+                    f"time remains."
+                )
+                audit.write(build_poll_record(
+                    window_id=window_id, ticker=ticker, close_dt=close_dt,
+                    decision="NO_TRADE", rec=rec,
+                    reasons=[f"cv_rev_veto: {_cvrev_reason}"],
+                    signal=sig, market=mkt, recent_5m_pct=recent_5m,
+                    tp_cached=window_tp_cache.get(window_id),
+                    db_check=None, ev_calc=None, params=audit_params,
+                    orderbook=ob_snap, trade_flow=tr_snap,
+                ))
+                if mins_left > 3.5:
+                    await asyncio.sleep(10)
+                else:
+                    session.traded.add(window_id)
+                    await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+                continue
+
+        # ── 2026-07-07: CV-EDGE SHADOW VETO (model-vs-market divergence) ──
+        # BTC study (190 settled windows, 183 sim entries): entries where
+        # the /edge model prices our side BELOW the market are net losers
+        # (side_edge <= -0.10: 50% win, -44c/c; every bucket < +0.05 net
+        # negative). Shadow only — records the decision point, never
+        # blocks. side_edge = model_p_for - market_p_for.
+        if cv_edge_veto_shadow and cv_state_path:
+            try:
+                with open(cv_state_path, encoding="utf-8") as _cedf:
+                    _ced_d = json.load(_cedf)
+                _ced_age = time.time() * 1000.0 - float(
+                    _ced_d.get("ts_ms") or 0)
+                _ced_e = _ced_d.get("edge") or {}
+                _ced_ea = _ced_age + float(_ced_d.get("edge_age_ms") or 9e9)
+                if (_ced_ea <= 60_000.0
+                        and _ced_e.get("market_id") == ticker
+                        and _ced_e.get("model_prob") is not None
+                        and _ced_e.get("market_prob") is not None):
+                    _ced_mp = float(_ced_e["model_prob"])
+                    _ced_kp = float(_ced_e["market_prob"])
+                    _ced_emp = _ced_mp if rec == "YES" else 1.0 - _ced_mp
+                    _ced_ekp = _ced_kp if rec == "YES" else 1.0 - _ced_kp
+                    _ced_side = _ced_emp - _ced_ekp
+                    if _ced_side <= cv_edge_veto_max:
+                        log.warning(
+                            f"CV-EDGE SHADOW VETO — {rec} @ {limit_price}c:"
+                            f" model_for {_ced_emp:.3f} - market_for"
+                            f" {_ced_ekp:.3f} = {_ced_side:+.3f} <="
+                            f" {cv_edge_veto_max:+.2f}; would skip entry"
+                            f" (shadow only, not blocking)")
+                        audit.write({
+                            "type": "CV_EDGE_VETO_SHADOW",
+                            "window_id": window_id,
+                            "ticker": ticker,
+                            "rec": rec,
+                            "limit_price_cents": int(limit_price),
+                            "model_for": round(_ced_emp, 4),
+                            "market_for": round(_ced_ekp, 4),
+                            "side_edge": round(_ced_side, 4),
+                            "cv_edge": _ced_e.get("edge"),
+                            "cv_buy_edge": _ced_e.get("buy_edge"),
+                            "edge_age_ms": int(_ced_ea),
+                            "mins_left": round(mins_left, 2),
+                        })
+            except Exception:
+                pass  # shadow only — never disturb the entry path
+
+        if cv_ev_veto_enabled and cv_state_path:
+            _cvev_reason = None
+            try:
+                with open(cv_state_path, encoding="utf-8") as _cvevf:
+                    _cvev_d = json.load(_cvevf)
+                _cvev_now = time.time() * 1000.0
+                _cvev_row_age = _cvev_now - float(_cvev_d.get("ts_ms") or 0)
+                if _cvev_row_age <= cv_ev_max_age_s * 1000.0:
+                    _cvev_p = _cvev_d.get("probability") or {}
+                    _cvev_p_age = _cvev_row_age + float(
+                        _cvev_d.get("probability_age_ms") or 9e9)
+                    if (_cvev_p.get("ensemble") is not None
+                            and _cvev_p.get("market_id") == ticker
+                            and _cvev_p_age <= 45_000):
+                        _cvev_pfor = (float(_cvev_p["ensemble"])
+                                      if rec == "YES"
+                                      else 1.0 - float(_cvev_p["ensemble"]))
+                        if _cvev_pfor < cv_ev_prob_min:
+                            _cvev_reason = (
+                                f"ensemble p_for {_cvev_pfor:.3f} < "
+                                f"{cv_ev_prob_min:.2f} (CV 6-estimator prob "
+                                f"at strike/TTE says coin flip)")
+                    if _cvev_reason is None:
+                        _cvev_v = _cvev_d.get("volatility") or {}
+                        _cvev_em = (_cvev_v.get("expected_move") or {})
+                        _cvev_v_age = _cvev_row_age + float(
+                            _cvev_d.get("volatility_age_ms") or 9e9)
+                        _cvev_sig = _cvev_em.get("sigma_pct")
+                        if (_cvev_sig and _cvev_v_age <= 60_000
+                                and mkt.get("dist_pct") is not None):
+                            _cvev_cush = abs(mkt["dist_pct"]) / float(_cvev_sig)
+                            if _cvev_cush < cv_ev_cushion_sigma_min:
+                                _cvev_reason = (
+                                    f"cushion {_cvev_cush:.2f}sigma < "
+                                    f"{cv_ev_cushion_sigma_min:.2f} (|dist| "
+                                    f"{abs(mkt['dist_pct']):.3f}% vs expected "
+                                    f"move {float(_cvev_sig):.3f}% at TTE)")
+            except Exception:
+                _cvev_reason = None
+            if _cvev_reason:
+                log.warning(
+                    f"CV-EV VETO — {rec} @ {limit_price}c: {_cvev_reason}; "
+                    f"skipping entry. Re-polling while time remains."
+                )
+                audit.write(build_poll_record(
+                    window_id=window_id, ticker=ticker, close_dt=close_dt,
+                    decision="NO_TRADE", rec=rec,
+                    reasons=[f"cv_ev_veto: {_cvev_reason}"],
+                    signal=sig, market=mkt, recent_5m_pct=recent_5m,
+                    tp_cached=window_tp_cache.get(window_id),
+                    db_check=None, ev_calc=None, params=audit_params,
+                    orderbook=ob_snap, trade_flow=tr_snap,
+                ))
+                if mins_left > 3.5:
+                    await asyncio.sleep(10)
+                else:
+                    session.traded.add(window_id)
+                    await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+                continue
+
+        # ── 2026-07-05: CHAINVECTOR ADVERSE-FLOW ENTRY VETO ─────────────────
+        # CV 30s signal-history replay vs 87 settled windows (28h): near the
+        # strike (|dist|<0.10%) a leaning-side call with cross-venue breadth
+        # against it (<0.25) or momentum against it (<=-25) reverses far more
+        # often than priced; an active liquidation cascade against the side
+        # (risk>=60) is toxic at any distance. Fail-open: stale/missing CV
+        # state (collector down) skips the check entirely. Transient re-poll
+        # like the perp/hurst vetoes — flow can turn back in our favor.
+        if cv_flow_veto_enabled and cv_state_path:
+            _cv_block_reason = None
+            try:
+                with open(cv_state_path, encoding="utf-8") as _cvf:
+                    _cv_d = json.load(_cvf)
+                _cv_age_ms = time.time() * 1000.0 - float(_cv_d.get("ts_ms") or 0)
+                if _cv_age_ms <= cv_flow_max_age_s * 1000.0:
+                    _cv_mom = _cv_d.get("momentum") or {}
+                    _cv_casc = _cv_d.get("cascade") or {}
+                    # 2026-07-06: per-block staleness (see CV-REV note)
+                    _cv_mom_age = _cv_age_ms + float(
+                        _cv_d.get("momentum_age_ms") or 9e9)
+                    _cv_casc_age = _cv_age_ms + float(
+                        _cv_d.get("cascade_age_ms") or 9e9)
+                    _cv_sgn = 1.0 if rec == "YES" else -1.0
+                    _cv_mom_for = (_cv_sgn * float(_cv_mom["aggregate_score"])
+                                   if _cv_mom.get("aggregate_score") is not None
+                                   else None)
+                    _cv_b = _cv_mom.get("breadth_up")
+                    _cv_breadth_for = ((float(_cv_b) if rec == "YES"
+                                        else 1.0 - float(_cv_b))
+                                       if _cv_b is not None else None)
+                    _cv_cr = float(_cv_casc.get("risk_score") or 0.0)
+                    _cv_casc_against = (_cv_cr if ((_cv_casc.get("cascade_side")
+                                        == "longs") == (rec == "YES")) else 0.0)
+                    _cv_dist = abs(mkt.get("dist_pct")
+                                   if mkt.get("dist_pct") is not None else 99.0)
+                    if (_cv_breadth_for is not None
+                            and _cv_breadth_for < cv_flow_breadth_min
+                            and _cv_mom_age <= 60_000.0
+                            and _cv_dist < cv_flow_dist_max):
+                        _cv_block_reason = (
+                            f"breadth_for {_cv_breadth_for:.2f} < "
+                            f"{cv_flow_breadth_min:.2f} & |dist| "
+                            f"{_cv_dist:.3f}% < {cv_flow_dist_max:.2f}%")
+                    elif (_cv_mom_for is not None
+                            and _cv_mom_for <= cv_flow_mom_min
+                            and _cv_mom_age <= 60_000.0
+                            and _cv_dist < cv_flow_dist_max):
+                        _cv_block_reason = (
+                            f"momentum_for {_cv_mom_for:.0f} <= "
+                            f"{cv_flow_mom_min:.0f} & |dist| "
+                            f"{_cv_dist:.3f}% < {cv_flow_dist_max:.2f}%")
+                    elif (_cv_casc_against >= cv_flow_cascade_min
+                            and _cv_casc_age <= 90_000.0):
+                        _cv_block_reason = (
+                            f"cascade_against {_cv_casc_against:.0f} >= "
+                            f"{cv_flow_cascade_min:.0f} "
+                            f"(side={_cv_casc.get('cascade_side')})")
+            except Exception:
+                _cv_block_reason = None
+            if _cv_block_reason:
+                log.warning(
+                    f"CV-FLOW VETO — {rec} @ {limit_price}c: "
+                    f"{_cv_block_reason}; cross-venue flow against the side, "
+                    f"skipping entry. Re-polling while time remains."
+                )
+                audit.write(build_poll_record(
+                    window_id=window_id, ticker=ticker, close_dt=close_dt,
+                    decision="NO_TRADE", rec=rec,
+                    reasons=[f"cv_flow_veto: {_cv_block_reason}"],
+                    signal=sig, market=mkt, recent_5m_pct=recent_5m,
+                    tp_cached=window_tp_cache.get(window_id),
+                    db_check=None, ev_calc=None, params=audit_params,
+                    orderbook=ob_snap, trade_flow=tr_snap,
+                ))
+                if mins_left > 3.5:
+                    await asyncio.sleep(10)
+                else:
+                    session.traded.add(window_id)
+                    await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+                continue
+
+        # ── 2026-07-05: HURST-CUSHION ENTRY VETO ────────────────────────────
+        # In a mean-reverting regime (Hurst < 0.40) a near-strike entry
+        # (|dist| < 0.20%) is a coin flip that tends to get pulled back
+        # through the strike. BTC 30d backtest: 97 blocked, saved $4,423 vs
+        # $2,260 clipped (NET +$2,163); blocked list contains every >$400
+        # near-strike reversal loss of the month (incl. 2026-07-02 -$484 and
+        # 2026-07-05 -$410). Re-poll: dist can widen / hurst can firm up, so
+        # this is a WAIT while time remains, not a rejection.
+        if (hurst_cushion_veto_enabled
+                and sig.get("hurst") is not None
+                and mkt.get("dist_pct") is not None
+                and sig["hurst"] < hurst_cushion_hurst_max
+                and abs(mkt["dist_pct"]) < hurst_cushion_dist_min):
+            log.warning(
+                f"HURST-CUSHION VETO — {rec} @ {limit_price}c: Hurst "
+                f"{sig['hurst']:.3f} < {hurst_cushion_hurst_max:.2f} (mean-"
+                f"reverting) with |dist| {abs(mkt['dist_pct']):.3f}% < "
+                f"{hurst_cushion_dist_min:.2f}% of strike; near-strike coin "
+                f"flip, skipping entry. Re-polling while time remains."
+            )
+            audit.write(build_poll_record(
+                window_id=window_id, ticker=ticker, close_dt=close_dt,
+                decision="NO_TRADE", rec=rec,
+                reasons=[f"hurst_cushion_veto: hurst={sig['hurst']:.3f} < "
+                         f"{hurst_cushion_hurst_max:.2f} & |dist|="
+                         f"{abs(mkt['dist_pct']):.3f}% < "
+                         f"{hurst_cushion_dist_min:.2f}%"],
+                signal=sig, market=mkt, recent_5m_pct=recent_5m,
+                tp_cached=window_tp_cache.get(window_id),
+                db_check=None, ev_calc=None, params=audit_params,
+                orderbook=ob_snap, trade_flow=tr_snap,
+            ))
+            if mins_left > 3.5:
+                await asyncio.sleep(10)
+            else:
+                session.traded.add(window_id)
+                await asyncio.sleep(max(5, (mins_left + 0.5) * 60))
+            continue
+
+        # ── ChainVector PREDICTION QUOTE-STABILITY VETO ──────────────────────
         # Cross-checks the local bid-stability read with ChainVector's
         # /predictions/stability for THIS ticker: momentum_score is the signed
         # YES-mid repricing speed (âˆ’100..+100, positive = YES getting more
@@ -5961,6 +6480,23 @@ async def main_loop(dry_run: bool, bankroll: float,
                 continue
 
         # â”€â”€ 2026-06-22: HARD ENTRY-PRICE FLOOR (all tiers, final pre-order) â”€â”€
+        # ── 2026-07-05: CHASE VETO ask-history (records BEFORE the price
+        # floor below — the cheap floor-blocked polls ARE the walk-up low).
+        if chase_veto_enabled:
+            try:
+                _chv_hist = globals().setdefault("_chase_hist", {})
+                _chv_key = (window_id, rec)
+                _chv_ask = (mkt.get("yes_ask") if rec == "YES"
+                            else mkt.get("no_ask")) or limit_price
+                _chv_hist.setdefault(_chv_key, []).append(
+                    (time.time(), _chv_ask))
+                if len(_chv_hist) > 60:
+                    for _chv_k in sorted(_chv_hist,
+                                         key=lambda k: k[0])[:-30]:
+                        _chv_hist.pop(_chv_k, None)
+            except Exception:
+                pass
+
         if min_entry_price > 0 and limit_price < min_entry_price:
             log.warning(
                 f"ENTRY-PRICE FLOOR â€” {rec} @ {limit_price}Â¢ < floor "
@@ -6936,6 +7472,27 @@ async def main_loop(dry_run: bool, bankroll: float,
                 "fired": False,
                 "max_score": 0,
             }
+            # 2026-07-04: anchor fallback. A transient spot-feed failure at
+            # monitor start (SOL 13:15 window: Coinbase returned 0.0 for one
+            # cycle) left the anchor None, silently disabling RRM AND the
+            # underlying-aware SL hold for the whole hold; the book faked out
+            # and the SL sold a winner (-$104.66, settled our way). Fall back
+            # to the most recent cached spot (<= a few poll cycles old).
+            if not rrm_state["anchor_btc"]:
+                try:
+                    if _CB_SPOT_HIST:
+                        rrm_state["anchor_btc"] = _CB_SPOT_HIST[-1][1]
+                        log.info("  RRM: anchor fallback -> cached spot %.6g"
+                                 % rrm_state["anchor_btc"])
+                except Exception:
+                    pass
+            if not rrm_state["anchor_perp"]:
+                try:
+                    _rp = latest_perp_mid()
+                    if _rp:
+                        rrm_state["anchor_perp"] = _rp
+                except Exception:
+                    pass
             if not (rrm_state["anchor_btc"] and rrm_state["anchor_perp"]
                     and rrm_state["strike"]):
                 log.info("  RRM: inactive for this position (missing anchor/feed)")
@@ -7511,6 +8068,133 @@ async def main_loop(dry_run: bool, bankroll: float,
                 # 2-min gate caught ~33 late reversals (+$1.8-2.1k) while
                 # touching only ~3 winners. One fire per position; min-contracts
                 # guard keeps small positions log-only.
+                # ── 2026-07-05: CV-REV IN-TRADE EXIT (ensemble prob-drop) ───
+                # Tape replay (173 windows / 23 reversals, 5 assets): a CV
+                # ensemble p-for-side that has FALLEN >=0.20 from its in-trade
+                # peak to <0.80 caught 22/23 reversals ~4 min before close with
+                # only 11% false-fires. Guards: 2 distinct collector rows,
+                # bid >= 40c (collapsed bids belong to the $-stop, not us),
+                # skip high_conv/late_sure, one live fire per position.
+                # Shadow arm (0.12/0.90) logs would-fire for calibration.
+                cvrev_exit_triggered = False
+                if (cv_rev_exit_enabled and cv_state_path
+                        and not pos.get("_cvrevx_fired")
+                        and position_tier not in ("high_conv", "late_sure")
+                        and mins_since_entry >= 1.0):
+                    try:
+                        with open(cv_state_path, encoding="utf-8") as _cvxf:
+                            _cvx_d = json.load(_cvxf)
+                        _cvx_age = (time.time() * 1000.0
+                                    - float(_cvx_d.get("ts_ms") or 0))
+                        _cvx_p = _cvx_d.get("probability") or {}
+                        _cvx_pa = _cvx_age + float(
+                            _cvx_d.get("probability_age_ms") or 9e9)
+                        if (_cvx_age <= cv_rev_max_age_s * 1000.0
+                                and _cvx_p.get("ensemble") is not None
+                                and _cvx_p.get("market_id") == pos_ticker
+                                and _cvx_pa <= 45_000):
+                            _cvx_raw = float(_cvx_p["ensemble"])
+                            _cvx_ts = float(_cvx_d.get("ts_ms") or 0)
+                            pos["_cvrevx_max"] = max(
+                                pos.get("_cvrevx_max", _cvx_raw), _cvx_raw)
+                            pos["_cvrevx_min"] = min(
+                                pos.get("_cvrevx_min", _cvx_raw), _cvx_raw)
+                            if pos_side == "YES":
+                                _cvx_pfor = _cvx_raw
+                                _cvx_peak = pos["_cvrevx_max"]
+                            else:
+                                _cvx_pfor = 1.0 - _cvx_raw
+                                _cvx_peak = 1.0 - pos["_cvrevx_min"]
+                            _cvx_drop = _cvx_peak - _cvx_pfor
+                            _cvx_live_c = (_cvx_drop >= cv_rev_exit_drop_min
+                                           and _cvx_pfor < cv_rev_exit_p_max)
+                            # 2026-07-06: losing-side gate. Calibration
+                            # (8 live-rule fires on tape): every true-
+                            # reversal save had spot on the LOSING side
+                            # of the strike; every clipped winner had
+                            # spot still on ours (strike-hugging noise,
+                            # e.g. SOL 202607062130). Only fire once CV
+                            # spot has actually crossed, unless p_for
+                            # collapsed below the floor (escape hatch
+                            # for slow bleeds). Fail-open on missing lm.
+                            if (_cvx_live_c and cv_rev_exit_lm_gate
+                                    and _cvx_pfor >= cv_rev_exit_lm_floor):
+                                _cvx_lm = (_cvx_p.get("inputs") or {}).get(
+                                    "log_moneyness")
+                                if _cvx_lm is not None:
+                                    _cvx_losing = ((float(_cvx_lm) > 0)
+                                                   if pos_side == "YES"
+                                                   else (float(_cvx_lm) < 0))
+                                    if not _cvx_losing:
+                                        _cvx_live_c = False
+                            _cvx_sh_c = (_cvx_drop >= 0.12
+                                         and _cvx_pfor < 0.90)
+                            if _cvx_ts != pos.get("_cvrevx_seen_ts"):
+                                pos["_cvrevx_seen_ts"] = _cvx_ts
+                                pos["_cvrevx_streak"] = (
+                                    pos.get("_cvrevx_streak", 0) + 1
+                                    if _cvx_live_c else 0)
+                                pos["_cvrevx_sh_streak"] = (
+                                    pos.get("_cvrevx_sh_streak", 0) + 1
+                                    if _cvx_sh_c else 0)
+                            _cvx_fire = (pos.get("_cvrevx_streak", 0)
+                                         >= cv_rev_exit_streak
+                                         and current_sell_price
+                                         >= cv_rev_exit_min_bid
+                                         and mins_remaining >= 1.0)
+                            _cvx_sh_fire = (
+                                pos.get("_cvrevx_sh_streak", 0) >= 2
+                                and not pos.get("_cvrevx_sh_logged"))
+                            if _cvx_fire or _cvx_sh_fire:
+                                _cvx_pnl = ((current_sell_price - entry_cents)
+                                            / 100.0 * pos_count)
+                                audit.write({
+                                    "type": "CV_REV_EXIT",
+                                    "window_id": window_id,
+                                    "ticker": pos_ticker,
+                                    "side": pos_side,
+                                    "contracts": pos_count,
+                                    "entry_cents": entry_cents,
+                                    "bid_cents": current_sell_price,
+                                    "would_realize_pnl": round(_cvx_pnl, 2),
+                                    "p_for": round(_cvx_pfor, 4),
+                                    "peak_for": round(_cvx_peak, 4),
+                                    "drop": round(_cvx_drop, 4),
+                                    "mins_remaining": round(mins_remaining, 2),
+                                    "mins_since_entry": round(mins_since_entry, 2),
+                                    "tier": position_tier,
+                                    "live_exit": bool(_cvx_fire),
+                                })
+                                if _cvx_sh_fire:
+                                    pos["_cvrevx_sh_logged"] = True
+                                    if not _cvx_fire:
+                                        log.warning(
+                                            f"  [CV-REV shadow] WOULD-EXIT "
+                                            f"[{pos_ticker}] {pos_side} "
+                                            f"{pos_count}c: p_for fell "
+                                            f"{_cvx_drop:.3f} from peak "
+                                            f"{_cvx_peak:.3f} to {_cvx_pfor:.3f}"
+                                            f" — would sell at "
+                                            f"{current_sell_price}c. NOT "
+                                            f"SELLING (aggressive arm, "
+                                            f"log-only).")
+                                if _cvx_fire:
+                                    cvrev_exit_triggered = True
+                                    pos["_cvrevx_fired"] = True
+                                    log.warning(
+                                        f"  [CV-REV EXIT] [{pos_ticker}] "
+                                        f"{pos_side} {pos_count}c: ensemble "
+                                        f"p_for fell {_cvx_drop:.3f} from "
+                                        f"in-trade peak {_cvx_peak:.3f} to "
+                                        f"{_cvx_pfor:.3f} (2 ticks) — flip "
+                                        f"risk, selling at bid "
+                                        f"{current_sell_price}c (entry "
+                                        f"{entry_cents}c, est ${_cvx_pnl:+.2f}"
+                                        f" vs ride-to-settle risk).")
+                    except Exception as _cvx_e:
+                        log.debug(f"  CV-REV exit eval failed (non-fatal): "
+                                  f"{_cvx_e!r}")
+
                 pcross_triggered = False
                 if (predict_cross_exit_enabled
                         and not pos.get("_pcross_fired")
@@ -7697,6 +8381,9 @@ async def main_loop(dry_run: bool, bankroll: float,
                 # 2026-06-18: predict-cross-exit rides the SL sell path
                 if pcross_triggered:
                     hit_stop = True
+                # 2026-07-05: CV-REV in-trade exit rides the SL sell path
+                if cvrev_exit_triggered:
+                    hit_stop = True
                 # â”€â”€ 2026-06-22: PER-TRADE DOLLAR STOP (golden/standard tail cap) â”€â”€
                 # Hard $ loss cap on the cheap tiers. Backtest (06-22): a ~$100
                 # per-trade stop flips golden+standard from net-negative to
@@ -7730,6 +8417,129 @@ async def main_loop(dry_run: bool, bankroll: float,
                         f"(-{loss_cents}Â¢/c x {pos_count}c) â‰¥ cap "
                         f"${_ds_cap:.0f} â€” flattening position."
                     )
+                # ── 2026-07-03: UNDERLYING-AWARE SL HOLD ────────────────────
+                # The cents/dollar stop fires off the venue BOOK, which can panic
+                # harder than the underlying (SOL 2026-07-03: stopped -$84 while spot
+                # never crossed the strike; market settled our way. Fleet backtest:
+                # 5/11 historical SL exits were such fake-outs, ~+$488 if held).
+                # If the basis-free spot estimate is still on OUR side of the strike
+                # by >= 0.02%, HOLD: skip this trigger, keep monitoring — SL re-fires
+                # within seconds once the underlying truly crosses. RRM/pcross exits
+                # are exempt (already underlying-gated). Fail-open on feed problems.
+                if (hit_stop and not rrm_exit_triggered and not pcross_triggered
+                        and not cvrev_exit_triggered
+                        and rrm_state.get("anchor_btc")
+                        and rrm_state.get("anchor_perp")
+                        and rrm_state.get("strike")):
+                    try:
+                        _ua_pm = latest_perp_mid()
+                        if _ua_pm:
+                            _ua_est = (rrm_state["anchor_btc"]
+                                       * (_ua_pm / rrm_state["anchor_perp"]))
+                            _ua_stk = rrm_state["strike"]
+                            _ua_m = _ua_stk * 0.0002
+                            _ua_safe = ((_ua_est >= _ua_stk + _ua_m)
+                                        if pos_side == "YES"
+                                        else (_ua_est <= _ua_stk - _ua_m))
+                            if _ua_safe:
+                                pos["_ua_holds"] = pos.get("_ua_holds", 0) + 1
+                                if pos["_ua_holds"] == 1 or pos["_ua_holds"] % 10 == 0:
+                                    log.warning(
+                                        f"  SL-HOLD (underlying-aware) [{pos_ticker}] "
+                                        f"{pos_side}: book trigger -{loss_cents}\u00a2/c but "
+                                        f"est_spot {_ua_est:.6g} still on our side of "
+                                        f"strike {_ua_stk} (hold #{pos['_ua_holds']}); "
+                                        f"not selling, monitoring continues")
+                                if pos["_ua_holds"] == 1:
+                                    audit.write({
+                                        "type": "SL_HOLD_UNDERLYING",
+                                        "window_id": window_id,
+                                        "ticker": pos_ticker, "side": pos_side,
+                                        "entry_cents": entry_cents,
+                                        "trigger_cents": int(trigger_price),
+                                        "loss_cents": int(loss_cents),
+                                        "est_spot": round(_ua_est, 6),
+                                        "strike": _ua_stk,
+                                        "mins_remaining": round(mins_remaining, 2),
+                                    })
+                                hit_stop = False
+                                dollar_stop_hit = False
+                    except Exception:
+                        pass  # fail-open: normal SL behavior
+
+                # ── 2026-07-06: CV-CONFIRMED SL DEFERRAL ────────────────────
+                # 5-week fleet study (119 SL/dollar-stop fires, OKX 1m spot
+                # reconstruction): 35% of stops clipped winners. Deferring
+                # iff spot is on OUR side of the strike AND model conviction
+                # p_for >= th kept the true-reversal saves and returned
+                # ~+$1.9k/5wk (proxy th 0.70 ~= live ensemble 0.75). Uses
+                # ChainVector's own spot (log_moneyness sign) + ensemble, so
+                # it also covers fires the perp-basis SL-HOLD can't reach.
+                # Re-evaluated every poll: conviction collapse or spot
+                # crossing the strike lets the stop fire normally. Dollar-
+                # cap fires are NEVER deferred; fail-open on stale CV.
+                if (cv_sl_defer_enabled and cv_state_path and hit_stop
+                        and not dollar_stop_hit
+                        and not rrm_exit_triggered and not pcross_triggered
+                        and not cvrev_exit_triggered):
+                    try:
+                        with open(cv_state_path, encoding="utf-8") as _slf:
+                            _sl_d = json.load(_slf)
+                        _sl_age = (time.time() * 1000.0
+                                   - float(_sl_d.get("ts_ms") or 0))
+                        _sl_p = _sl_d.get("probability") or {}
+                        _sl_pa = _sl_age + float(
+                            _sl_d.get("probability_age_ms") or 9e9)
+                        _sl_lm = (_sl_p.get("inputs") or {}).get(
+                            "log_moneyness")
+                        if (_sl_pa <= 45_000.0
+                                and _sl_p.get("market_id") == pos_ticker
+                                and _sl_p.get("ensemble") is not None
+                                and _sl_lm is not None):
+                            _sl_ens = float(_sl_p["ensemble"])
+                            # lm = ln(strike/spot): lm < 0 means spot is
+                            # ABOVE the strike (YES side winning)
+                            if pos_side == "YES":
+                                _sl_pfor = _sl_ens
+                                _sl_winning = float(_sl_lm) < 0
+                            else:
+                                _sl_pfor = 1.0 - _sl_ens
+                                _sl_winning = float(_sl_lm) > 0
+                            if (_sl_winning
+                                    and _sl_pfor >= cv_sl_defer_p_min):
+                                pos["_cvsl_defers"] = (
+                                    pos.get("_cvsl_defers", 0) + 1)
+                                _sl_n = pos["_cvsl_defers"]
+                                if _sl_n == 1 or _sl_n % 10 == 0:
+                                    log.warning(
+                                        f"  SL-DEFER (CV-confirmed) "
+                                        f"[{pos_ticker}] {pos_side}: book "
+                                        f"trigger -{loss_cents}\u00a2/c "
+                                        f"but CV spot on our side (lm="
+                                        f"{float(_sl_lm):+.5f}) with "
+                                        f"p_for={_sl_pfor:.3f} >= "
+                                        f"{cv_sl_defer_p_min:.2f} (hold "
+                                        f"#{_sl_n}); not selling, "
+                                        f"monitoring continues")
+                                if _sl_n == 1:
+                                    audit.write({
+                                        "type": "CV_SL_DEFER",
+                                        "window_id": window_id,
+                                        "ticker": pos_ticker,
+                                        "side": pos_side,
+                                        "entry_cents": entry_cents,
+                                        "trigger_cents": int(trigger_price),
+                                        "loss_cents": int(loss_cents),
+                                        "p_for": round(_sl_pfor, 4),
+                                        "log_moneyness": round(
+                                            float(_sl_lm), 6),
+                                        "mins_remaining": round(
+                                            mins_remaining, 2),
+                                        "tier": position_tier,
+                                    })
+                                hit_stop = False
+                    except Exception:
+                        pass  # fail-open: normal SL when CV stale/absent
 
                 # â”€â”€ 2026-06-15: PERP-CONFIRMED TAKE-PROFIT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # Resting TP at entry+take_profit_cents. Backtest: on perp-
@@ -8148,7 +8958,8 @@ async def main_loop(dry_run: bool, bankroll: float,
                         sl_exited = True
                         break
 
-                if not fast_exit_triggered and not rrm_exit_triggered and not tp_triggered:
+                if (not fast_exit_triggered and not rrm_exit_triggered and not tp_triggered
+                        and not cvrev_exit_triggered):
                     log.warning(
                         f"  STOP-LOSS HIT [{pos_ticker}] tier={position_tier}: entry={entry_cents}Â¢, "
                         f"trigger({sl_trigger_mode})={trigger_price}Â¢, sell_bid={current_sell_price}Â¢, "
@@ -8275,12 +9086,14 @@ async def main_loop(dry_run: bool, bankroll: float,
                 is_partial = sell_filled < sell_count
                 partial_tag = f" (PARTIAL {sell_filled}/{sell_count})" if is_partial else ""
                 exit_reason = ("take-profit" if tp_triggered
+                               else "cv-rev-exit" if cvrev_exit_triggered
                                else "predict-cross-exit" if pcross_triggered
                                else "rrm-reversal-exit" if rrm_exit_triggered
                                else "futures-fast-exit" if fast_exit_triggered
                                else "dollar-stop" if dollar_stop_hit
                                else "stop-loss")
                 exit_tag = ("TAKE-PROFIT" if tp_triggered
+                            else "CVREV-EXIT" if cvrev_exit_triggered
                             else "PCROSS-EXIT" if pcross_triggered
                             else "RRM-EXIT" if rrm_exit_triggered
                             else "FAST-EXIT" if fast_exit_triggered else "SL-EXIT")
@@ -8333,6 +9146,7 @@ async def main_loop(dry_run: bool, bankroll: float,
                     "fast_exit_futures_move_pct": (round(fast_exit_move_pct, 4)
                                                     if fast_exit_triggered else None),
                     "rrm_exit_triggered":  rrm_exit_triggered,
+                    "cvrev_exit_triggered": cvrev_exit_triggered,
                     "rrm_max_score":       rrm_state.get("max_score", 0),
                     # 2026-05-31: bid trajectory observed during SL monitor
                     "min_bid_cents":             pos.get("min_bid_cents"),
@@ -9952,6 +10766,81 @@ if __name__ == "__main__":
                              "side) at or below which entry is vetoed. "
                              "Default -10.0 (canonical baseline).")
     # â”€â”€ 2026-07-02: POLYMARKET BID-STABILITY ENTRY VETO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── 2026-07-05: HURST-CUSHION ENTRY VETO ────────────────────────────────
+    parser.add_argument("--hurst-cushion-veto-enabled", action="store_true",
+                        help="Block entries when Hurst < hurst-max AND "
+                             "|dist from strike| < dist-min (near-strike "
+                             "coin flip in mean-reverting tape). BTC 30d "
+                             "backtest NET +$2,163.")
+    parser.add_argument("--hurst-cushion-hurst-max", type=float, default=0.40)
+    parser.add_argument("--hurst-cushion-dist-min", type=float, default=0.20)
+    # ── 2026-07-05: CHAINVECTOR SHADOW STAMP (record-only) ──────────────────
+    parser.add_argument("--cv-shadow-enabled", action="store_true",
+                        help="Stamp a 'chainvector' block (from the cv_collector "
+                             "latest_ASSET.json) into every audit record. "
+                             "Record-only: no decision-path changes.")
+    parser.add_argument("--cv-asset", type=str, default="",
+                        help="ChainVector asset symbol, e.g. BTC")
+    parser.add_argument("--cv-state-dir", type=str,
+                        default=os.environ.get("CV_STATE_DIR", "cv_state"),
+                        help="Directory where cv_collector.py writes "
+                             "latest_{asset}.json (default ./cv_state, or "
+                             "the CV_STATE_DIR env var).")
+    parser.add_argument("--cv-max-age-s", type=float, default=20.0)
+    # ── 2026-07-05: CHAINVECTOR ADVERSE-FLOW ENTRY VETO ─────────────────────
+    parser.add_argument("--cv-flow-veto-enabled", action="store_true",
+                        help="Block near-strike entries when ChainVector "
+                             "cross-venue breadth/momentum is against the "
+                             "side, or a liquidation cascade is running "
+                             "against it. Reads cv_state latest_{asset}.json;"
+                             " fail-open when stale.")
+    parser.add_argument("--cv-flow-breadth-min", type=float, default=0.25)
+    parser.add_argument("--cv-flow-mom-min", type=float, default=-25.0)
+    parser.add_argument("--cv-flow-cascade-min", type=float, default=60.0)
+    parser.add_argument("--cv-flow-dist-max", type=float, default=0.10)
+    parser.add_argument("--cv-flow-max-age-s", type=float, default=20.0)
+    # ── 2026-07-05: CV-EV ENTRY VETO ─────────────────────────────────────────
+    parser.add_argument("--cv-ev-veto-enabled", action="store_true",
+                        help="Block entries when the ChainVector ensemble "
+                             "probability for our side < prob-min, or "
+                             "|dist| < cushion-sigma-min x CV expected-move "
+                             "sigma at exact TTE. Fail-open on stale state.")
+    parser.add_argument("--cv-ev-prob-min", type=float, default=0.75)
+    parser.add_argument("--cv-ev-cushion-sigma-min", type=float, default=0.50)
+    parser.add_argument("--cv-ev-max-age-s", type=float, default=30.0)
+    # ── 2026-07-05: CV-REV ENTRY VETO (flip-market detector) ─────────────────
+    parser.add_argument("--cv-rev-veto-enabled", action="store_true",
+                        help="Block entries when the CV ensemble prob for "
+                             "our side has fallen >= drop-min from its "
+                             "window peak (< p-max), or a lone pump is "
+                             "running (whale flow against + no cross-venue "
+                             "breadth + momentum <= mom-max). Fail-open.")
+    parser.add_argument("--cv-rev-drop-min", type=float, default=0.12)
+    parser.add_argument("--cv-rev-p-max", type=float, default=0.90)
+    parser.add_argument("--cv-rev-whale-max", type=float, default=-60.0)
+    parser.add_argument("--cv-rev-breadth-max", type=float, default=0.25)
+    parser.add_argument("--cv-rev-mom-max", type=float, default=0.0)
+    parser.add_argument("--cv-rev-max-age-s", type=float, default=30.0)
+    # ── 2026-07-05: CV-REV IN-TRADE EXIT ─────────────────────────────────────
+    parser.add_argument("--cv-rev-exit-enabled", action="store_true",
+                        help="In-trade exit when the CV ensemble prob for "
+                             "our side falls >= exit-drop-min from its "
+                             "in-trade peak to < exit-p-max (2 collector "
+                             "ticks, bid >= exit-min-bid). Shadow-logs the "
+                             "aggressive 0.12/0.90 variant. Fail-open.")
+    parser.add_argument("--cv-rev-exit-drop-min", type=float, default=0.20)
+    parser.add_argument("--cv-rev-exit-p-max", type=float, default=0.80)
+    parser.add_argument("--cv-rev-exit-min-bid", type=int, default=40)
+    # ── 2026-07-05: CHASE ENTRY VETO (native, no CV dependency) ──────────────
+    parser.add_argument("--chase-veto-enabled", action="store_true",
+                        help="Block entries when our side's ask has walked "
+                             ">= walkup-cents above its lookback low while "
+                             "hurst < hurst-max (mean-reverting tape): "
+                             "buying the re-test top of a move that "
+                             "statistically fades. Native (no ChainVector).")
+    parser.add_argument("--chase-veto-walkup-cents", type=int, default=22)
+    parser.add_argument("--chase-veto-hurst-max", type=float, default=0.45)
+    parser.add_argument("--chase-veto-lookback-mins", type=float, default=4.0)
     parser.add_argument("--bid-stab-veto-enabled", action="store_true", default=True,
                         help="Skip entries unless our side's Polymarket bid "
                              "(100 - opposite ask) has been stable or rising "
@@ -10144,7 +11033,80 @@ if __name__ == "__main__":
     parser.add_argument("--holdwin-min-gap", type=float, default=0.30,
                         help="Min entry Markov gap to hold a golden/standard "
                              "winner to settlement (skip resting TP). Default 0.30.")
+    parser.add_argument("--cv-rev-cross-min", type=int, default=0,
+                        help="CV-REV whipsaw arm: veto entry when spot "
+                             "crossed the strike this many times in 4m. "
+                             "0 = off.")
+    parser.add_argument("--cv-rev-spike-min", type=float, default=0.0,
+                        help="CV-REV fresh-spike arm: veto entry when "
+                             "ensemble p_for rose this much within 3m. "
+                             "0 = off.")
+    parser.add_argument("--cv-sl-defer-enabled", action="store_true",
+                        help="Defer the cents/dollar stop-loss while CV "
+                             "spot is on our side of the strike AND "
+                             "ensemble p_for >= --cv-sl-defer-p-min "
+                             "(dollar-cap fires never deferred).")
+    parser.add_argument("--cv-sl-defer-p-min", type=float, default=0.75,
+                        help="Min CV ensemble p_for to defer a stop-loss.")
+    parser.add_argument("--cv-rev-exit-lm-gate", action="store_true",
+                        help="Only let the live CV-REV exit fire when CV "
+                             "spot is on the losing side of the strike "
+                             "(or p_for < --cv-rev-exit-lm-floor).")
+    parser.add_argument("--cv-rev-exit-lm-floor", type=float, default=0.45,
+                        help="p_for below this fires regardless of spot "
+                             "side (lm-gate escape hatch).")
+    parser.add_argument("--cv-rev-exit-streak", type=int, default=2,
+                        help="Consecutive collector rows required for a "
+                             "live CV-REV exit fire.")
+    parser.add_argument("--cv-edge-veto-shadow", action="store_true",
+                        help="Shadow-log entries where the CV /edge model "
+                             "prices our side below the market (never "
+                             "blocks).")
+    parser.add_argument("--cv-edge-veto-max", type=float, default=-0.05,
+                        help="Shadow fires when model_for - market_for "
+                             "<= this (side-adjusted edge).")
     args = parser.parse_args()
+    # ── 2026-07-05: CHAINVECTOR SHADOW STAMP ──────────────────────────────────
+    # Wrap AuditLogger.write so every audit record carries the ChainVector
+    # feature set that was current at decision time. Read-only on a local
+    # file the collector refreshes every ~5s; a CV outage degrades to
+    # {"stale": true} and can never raise into the daemon.
+    if args.cv_shadow_enabled and args.cv_asset:
+        import audit_log as _cv_audit_mod
+
+        _cv_state_path = os.path.join(args.cv_state_dir,
+                                      f"latest_{args.cv_asset}.json")
+        _cv_max_age_ms = args.cv_max_age_s * 1000.0
+        _cv_orig_write = _cv_audit_mod.AuditLogger.write
+
+        def _cv_compact(obj):
+            # Drop bulky per-venue arrays; keep every scalar feature.
+            if isinstance(obj, dict):
+                return {k: _cv_compact(v) for k, v in obj.items()
+                        if k not in ("venues", "rationale", "points")}
+            if isinstance(obj, list):
+                return [_cv_compact(v) for v in obj]
+            return obj
+
+        def _cv_shadow_write(self, record, _orig=_cv_orig_write):
+            try:
+                with open(_cv_state_path, encoding="utf-8") as _f:
+                    _d = json.load(_f)
+                _age = time.time() * 1000.0 - float(_d.get("ts_ms") or 0)
+                if _age <= _cv_max_age_ms:
+                    _d = _cv_compact(_d)
+                    _d["cv_age_ms"] = int(_age)
+                    record["chainvector"] = _d
+                else:
+                    record["chainvector"] = {"stale": True,
+                                             "cv_age_ms": int(_age)}
+            except Exception as _e:
+                record["chainvector"] = {"error": str(_e)[:100]}
+            return _orig(self, record)
+
+        _cv_audit_mod.AuditLogger.write = _cv_shadow_write
+        print(f"[cv-shadow] enabled: {_cv_state_path} "
+              f"(max age {args.cv_max_age_s:.0f}s)", flush=True)
 
     # ── Strategy templates (--strategy) ──────────────────────────────────────
     # Named presets over the existing gate stack. A preset only touches knobs
@@ -10432,6 +11394,46 @@ if __name__ == "__main__":
             perp_veto_enabled=args.perp_veto_enabled,
             perp_veto_m30s_threshold=args.perp_veto_m30s_threshold,
             bid_stab_veto_enabled=args.bid_stab_veto_enabled,
+            hurst_cushion_veto_enabled=args.hurst_cushion_veto_enabled,
+            cv_flow_veto_enabled=args.cv_flow_veto_enabled,
+            cv_flow_breadth_min=args.cv_flow_breadth_min,
+            cv_flow_mom_min=args.cv_flow_mom_min,
+            cv_flow_cascade_min=args.cv_flow_cascade_min,
+            cv_flow_dist_max=args.cv_flow_dist_max,
+            cv_flow_max_age_s=args.cv_flow_max_age_s,
+            cv_ev_veto_enabled=args.cv_ev_veto_enabled,
+            cv_ev_prob_min=args.cv_ev_prob_min,
+            cv_ev_cushion_sigma_min=args.cv_ev_cushion_sigma_min,
+            cv_ev_max_age_s=args.cv_ev_max_age_s,
+            cv_rev_veto_enabled=args.cv_rev_veto_enabled,
+            cv_rev_drop_min=args.cv_rev_drop_min,
+            cv_rev_p_max=args.cv_rev_p_max,
+            cv_edge_veto_shadow=args.cv_edge_veto_shadow,
+            cv_edge_veto_max=args.cv_edge_veto_max,
+            cv_sl_defer_enabled=args.cv_sl_defer_enabled,
+            cv_sl_defer_p_min=args.cv_sl_defer_p_min,
+            cv_rev_cross_min=args.cv_rev_cross_min,
+            cv_rev_spike_min=args.cv_rev_spike_min,
+            cv_rev_whale_max=args.cv_rev_whale_max,
+            cv_rev_breadth_max=args.cv_rev_breadth_max,
+            cv_rev_mom_max=args.cv_rev_mom_max,
+            cv_rev_max_age_s=args.cv_rev_max_age_s,
+            cv_rev_exit_enabled=args.cv_rev_exit_enabled,
+            cv_rev_exit_drop_min=args.cv_rev_exit_drop_min,
+            cv_rev_exit_p_max=args.cv_rev_exit_p_max,
+            cv_rev_exit_lm_gate=args.cv_rev_exit_lm_gate,
+            cv_rev_exit_lm_floor=args.cv_rev_exit_lm_floor,
+            cv_rev_exit_streak=args.cv_rev_exit_streak,
+            cv_rev_exit_min_bid=args.cv_rev_exit_min_bid,
+            chase_veto_enabled=args.chase_veto_enabled,
+            chase_veto_walkup_cents=args.chase_veto_walkup_cents,
+            chase_veto_hurst_max=args.chase_veto_hurst_max,
+            chase_veto_lookback_mins=args.chase_veto_lookback_mins,
+            cv_state_path=(os.path.join(args.cv_state_dir,
+                                        f"latest_{args.cv_asset}.json")
+                           if args.cv_asset else ""),
+            hurst_cushion_hurst_max=args.hurst_cushion_hurst_max,
+            hurst_cushion_dist_min=args.hurst_cushion_dist_min,
             bid_stab_lookback_s=args.bid_stab_lookback_s,
             bid_stab_max_fade_cents=args.bid_stab_max_fade_cents,
             bid_stab_min_samples=args.bid_stab_min_samples,

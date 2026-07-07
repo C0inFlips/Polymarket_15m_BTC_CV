@@ -43,6 +43,27 @@ All ChainVector reads are **fail-open**: if the API is down or the key is
 missing, the affected gates go neutral and the daemon falls back to its core
 Markov + Polymarket-native logic.
 
+### ChainVector state collector (`cv_collector.py`)
+
+A second layer of CV gates reads a local JSON state file instead of hitting
+the API inside the decision path. `cv_collector.py` polls ChainVector every
+~5s and writes `cv_state/latest_{ASSET}.json` (probability at the current
+window's strike with exact TTE, momentum scorecard, signals snapshot,
+cascade risk, `/predictions/edge` for the live market, volatility, and a
+rolling probability window for whipsaw/spike detection). The daemon reads
+it read-only and every consumer fails open when the file is missing or
+stale — so the collector can die without ever blocking the daemon.
+
+```bash
+# terminal 1 — collector
+python cv_collector.py --asset BTC --state-dir cv_state
+
+# terminal 2 — daemon with the collector-backed gates armed
+python trade_daemon.py --cv-asset BTC --cv-state-dir cv_state \
+    --cv-shadow-enabled --cv-flow-veto-enabled --cv-ev-veto-enabled \
+    --cv-rev-veto-enabled --cv-rev-exit-enabled --cv-sl-defer-enabled
+```
+
 ## Setup
 
 ```bash
@@ -279,6 +300,71 @@ that flips them. "Tier" refers to the entry tiers: `golden` (65–73¢ band),
 | `--golden-near-vol-veto` / `--no-golden-near-vol-veto` | **on** | Skip golden entries that are near-strike AND in elevated short-term vol (knife-edge bucket). |
 | `--golden-near-vol-dist-max` | `0.08` | \|dist %\| below which a golden entry counts as "near". |
 | `--golden-near-vol-gk-min` | `0.0020` | GK vol at/above which it counts as "high-vol". |
+| `--hurst-cushion-veto-enabled` | off | Block near-strike entries in a mean-reverting regime (Hurst < max AND \|dist\| < min — the near-strike coin-flip bucket; BTC 30d backtest NET +$2,163). |
+| `--hurst-cushion-hurst-max` | `0.40` | Hurst below this = mean-reverting. |
+| `--hurst-cushion-dist-min` | `0.20` | \|dist %\| below this = near-strike. |
+| `--chase-veto-enabled` | off | Block entries whose ask walked ≥ walkup-cents above its lookback low while Hurst < max (buying the re-test top of a fading move). Native — no ChainVector dependency. |
+| `--chase-veto-walkup-cents` | `22` | Min ask walk-up (¢) off the lookback low. |
+| `--chase-veto-hurst-max` | `0.45` | Hurst must be below this (mean-reverting) for the veto to arm. |
+| `--chase-veto-lookback-mins` | `4.0` | Ask-history lookback (minutes). |
+
+An always-on **adverse-M60S high-price veto** (no flag) also blocks entries
+priced ≥ 90¢ while the 60s perp tape runs ≥ 10bp against the position —
+paying near-max price to fight an in-progress move (fleet backtest NET +$660).
+
+### ChainVector collector gates (require `cv_collector.py` + `--cv-asset`)
+
+All of these read `latest_{asset}.json` and **fail open** when the file is
+missing/stale. `market_id` guards mean the probability-based gates only act
+when the collector priced the exact market the daemon is trading.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--cv-shadow-enabled` | off | Stamp the full ChainVector feature set into every audit record (record-only; needs `--cv-asset`). |
+| `--cv-asset` | `""` | ChainVector asset symbol (e.g. `BTC`). Setting it resolves `cv_state_path` for every collector-backed gate. |
+| `--cv-state-dir` | `cv_state` | Directory the collector writes to (or `CV_STATE_DIR` env). |
+| `--cv-max-age-s` | `20` | Max state-file age for the shadow stamp. |
+| `--cv-flow-veto-enabled` | off | Block near-strike entries when cross-venue breadth/momentum is against the side, or a liquidation cascade is running against it. |
+| `--cv-flow-breadth-min` | `0.25` | Breadth-for-side below this (near strike) blocks. |
+| `--cv-flow-mom-min` | `-25.0` | Signed momentum-for-side at/below this (near strike) blocks. |
+| `--cv-flow-cascade-min` | `60.0` | Cascade risk against the side at/above this blocks at any distance. |
+| `--cv-flow-dist-max` | `0.10` | \|dist %\| below which the breadth/momentum arms apply. |
+| `--cv-flow-max-age-s` | `20` | Max state age (seconds). |
+| `--cv-ev-veto-enabled` | off | Block when the CV ensemble p-for-side < prob-min, or \|dist\| < cushion-sigma-min × the CV expected-move sigma at exact TTE (calibration: Brier 0.06–0.10 vs 0.19 for the venue mid). |
+| `--cv-ev-prob-min` | `0.75` | Ensemble p-for-side floor. |
+| `--cv-ev-cushion-sigma-min` | `0.50` | Min cushion in expected-move sigmas. |
+| `--cv-ev-max-age-s` | `30` | Max state age (seconds). |
+| `--cv-rev-veto-enabled` | off | Flip-market detector: block when p-for-side fell ≥ drop-min from its window peak (< p-max), or a "lone pump" is running (whale flow against + no breadth + momentum against). |
+| `--cv-rev-drop-min` | `0.12` | Min p_for drop from the window peak. |
+| `--cv-rev-p-max` | `0.90` | Drop arm only fires below this p_for. |
+| `--cv-rev-whale-max` | `-60.0` | Lone-pump: whale-flow-for-side at/below this. |
+| `--cv-rev-breadth-max` | `0.25` | Lone-pump: breadth-for-side at/below this. |
+| `--cv-rev-mom-max` | `0.0` | Lone-pump: momentum-for-side at/below this. |
+| `--cv-rev-max-age-s` | `30` | Max state age (seconds). |
+| `--cv-rev-cross-min` | `0` | Whipsaw arm: veto when spot crossed the strike ≥ this many times in 4m. 0 = off. |
+| `--cv-rev-spike-min` | `0.0` | Fresh-spike arm: veto when p_for rose ≥ this within 3m (unconsolidated move). 0 = off. |
+| `--cv-edge-veto-shadow` | off | Shadow-log entries where the `/edge` model prices our side below the market (never blocks). |
+| `--cv-edge-veto-max` | `-0.05` | Shadow fires when model_for − market_for ≤ this. |
+
+### ChainVector collector exits & stop-loss holds
+
+| Flag | Default | Description |
+|---|---|---|
+| `--cv-rev-exit-enabled` | off | In-trade exit when the CV ensemble p-for-side falls ≥ exit-drop-min from its in-trade peak to < exit-p-max over ≥ `--cv-rev-exit-streak` collector rows (tape replay: caught 22/23 reversals ~4 min early, 11% false fires). Skips high_conv/late_sure; one live fire per position; shadow arm logs the aggressive 0.12/0.90 variant. |
+| `--cv-rev-exit-drop-min` | `0.20` | Min p_for drop from the in-trade peak. |
+| `--cv-rev-exit-p-max` | `0.80` | Fires only below this p_for. |
+| `--cv-rev-exit-min-bid` | `40` | Min bid (¢) — collapsed bids belong to the $-stop. |
+| `--cv-rev-exit-streak` | `2` | Consecutive collector rows required for a live fire. |
+| `--cv-rev-exit-lm-gate` | off | Only fire once CV spot is on the losing side of the strike (or p_for < lm-floor escape hatch). |
+| `--cv-rev-exit-lm-floor` | `0.45` | p_for below this fires regardless of spot side. |
+| `--cv-sl-defer-enabled` | off | Defer the cents stop-loss while CV spot is on our side of the strike AND p_for ≥ p-min (5-week study: 35% of stops clipped winners; deferral returned ~+$1.9k). Dollar-cap fires are never deferred. |
+| `--cv-sl-defer-p-min` | `0.75` | Min ensemble p_for to defer. |
+
+An always-on **underlying-aware SL hold** (no flag) additionally skips
+book-driven stop triggers while the basis-free perp spot estimate is still
+on our side of the strike by ≥ 0.02% — fleet backtest: 5/11 historical SL
+exits were book fake-outs (~+$488 if held). RRM/pcross/CV-REV exits bypass
+the hold (already underlying-gated).
 
 ### Sizing & confirmation boosts
 
@@ -449,6 +535,8 @@ python-service/
                        # Data-API positions — legacy exchange schema surface
   run_backtest.py      # Markov stack + candle fetch (ChainVector 1m agg)
   chainvector.py       # ChainVector client (cached, rate-limited, fail-open)
+  cv_collector.py      # ~5s ChainVector state writer (latest_{asset}.json)
+                       # backing the CV-FLOW/CV-EV/CV-REV/SL-defer gates
   cv_lead.py           # /momentum background poller -> lead-lag venue views
   signal_feeds.py      # live signal snapshot + RRM + flip-prob composite
   terminal_prob.py     # probability engine wrapper (exact close_ts TTE)

@@ -250,6 +250,9 @@ class ChainVectorClient:
         out["sigma_horizon"] = inputs.get("sigma_horizon")
         out["sigma_1m"] = inputs.get("sigma_1m")
         out["sample_bars"] = inputs.get("sample_bars")
+        # ln(target/spot) — sign tells which side of the strike spot is on
+        # (negative = spot above strike). Used by the CV-REV/SL-defer gates.
+        out["log_moneyness"] = inputs.get("log_moneyness")
         return out
 
     @staticmethod
